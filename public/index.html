@@ -115,27 +115,43 @@ dialog p{font-size:14px;color:var(--mute)}
 
 <dialog id="settings">
   <form method="dialog">
-    <h2 style="margin-top:0;font-size:20px">PageSpeed key (optional, free)</h2>
-    <p>PageSpeed adds Google's performance, SEO and accessibility scores, plus a screenshot of each site. Without a key, Google's shared quota often runs out. A free key gives you 25,000 checks a day and needs no billing.</p>
-    <p>Get one: Google Cloud Console → APIs &amp; Services → enable "PageSpeed Insights API" → Credentials → Create API key. The key is stored only on this computer.</p>
-    <input id="psiKey" type="password" placeholder="Paste API key" style="width:100%">
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
-      <button value="cancel">Cancel</button><button class="go" id="saveKey" value="save">Save</button>
+    <h2 style="margin-top:0;font-size:20px">Settings</h2>
+    <p id="psiState"></p>
+    <p>Scans, website checks and notes are saved in this browser only. Use Backup to keep a copy or move your leads to another device, then Restore on that device.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:8px">
+      <button type="button" id="backupBtn">Backup</button>
+      <label class="chip" style="min-height:44px;position:relative">Restore<input type="file" id="restoreFile" accept="application/json,.json" style="position:absolute;opacity:0;width:1px;height:1px"></label>
+      <button type="button" id="lockBtn">Lock this device</button>
     </div>
+    <div style="display:flex;justify-content:flex-end;margin-top:14px"><button value="close" class="go">Done</button></div>
   </form>
 </dialog>
 
+<dialog id="gate">
+  <form id="gateForm">
+    <h2 style="margin-top:0;font-size:20px">Enter passcode</h2>
+    <p>This is the APP_PASSWORD you set in Cloudflare. It's remembered on this device.</p>
+    <input id="passIn" type="password" autocomplete="current-password" style="width:100%" required>
+    <p class="status err" id="gateErr"></p>
+    <div style="display:flex;justify-content:flex-end"><button class="go">Unlock</button></div>
+  </form>
+</dialog>
+
+<script src="analyzer.js"></script>
 <script src="scoring.js"></script>
 <script>
 {
 const $ = s => document.querySelector(s);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const api = async (p, body) => {
-  const r = await fetch(p, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || 'Request failed');
-  return j;
+// Saved data lives in this browser (IndexedDB), one record per kind.
+const DB = {
+  db: null,
+  open() { return this.db ||= new Promise((ok, no) => { const r = indexedDB.open('site-scout', 1); r.onupgradeneeded = () => r.result.createObjectStore('kv'); r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error); }); },
+  async get(k) { const d = await this.open(); return new Promise((ok, no) => { const r = d.transaction('kv').objectStore('kv').get(k); r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error); }); },
+  async set(k, v) { const d = await this.open(); return new Promise((ok, no) => { const t = d.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, k); t.oncomplete = ok; t.onerror = () => no(t.error); }); },
 };
+const timers = {};
+const persist = k => { clearTimeout(timers[k]); timers[k] = setTimeout(() => DB.set(k, S[k]).catch(e => setStatus('Could not save: ' + e.message, true)), 400); };
 const S = { cats: {}, scans: [], analyses: {}, psi: {}, leads: {}, cur: null, tab: 'all', running: false, stop: false };
 const PRESENCE = { none: 'No website', social: 'Social only', weak: 'Free builder site', site: 'Has website' };
 const setStatus = (t, err) => { const s = $('#status'); s.textContent = t; s.className = 'status' + (err ? ' err' : ''); };
@@ -174,6 +190,7 @@ function meter(label, v) {
 function card(b, i) {
   const a = i.a, wp = a && a.wp;
   const badges = [`<span class="b${b.presence === 'site' ? '' : ' hot'}">${esc(PRESENCE[b.presence])}</span>`];
+  if (a && a.blocked) badges.push('<span class="b">Bot wall: check by hand</span>');
   if (a && (a.dead || a.parked)) badges.push(`<span class="b hot">${a.parked ? 'Parked domain' : esc(a.error || 'Site down')}</span>`);
   if (wp && wp.detected) badges.push(`<span class="b dark">WordPress ${esc(wp.version || '(version hidden)')}</span>`);
   if (wp && wp.outdated) badges.push(`<span class="b hot">${wp.behind} releases behind</span>`);
@@ -239,7 +256,7 @@ async function pool(items, size, fn, label) {
   setStatus(`${S.stop ? 'Stopped' : 'Done'}: ${label.toLowerCase()} ${done} of ${items.length}${fails ? `, ${fails} failed` : ''}.`);
 }
 
-async function checkSite(b) { S.analyses[b.url] = await api('/api/analyze', { url: b.url }); }
+async function checkSite(b) { S.analyses[b.url] = await Scout.analyzeSite(b.url); persist('analyses'); }
 
 $('#scanForm').addEventListener('submit', async e => {
   e.preventDefault();
@@ -247,8 +264,8 @@ $('#scanForm').addEventListener('submit', async e => {
   try { localStorage.setItem('ss-cats', JSON.stringify(categories)); } catch {}
   $('#scanBtn').disabled = true; setStatus('Scanning map data. Big areas can take up to a minute…');
   try {
-    const s = await api('/api/scan', { location: $('#loc').value, radiusMiles: $('#radius').value, categories });
-    S.scans = [s, ...S.scans.filter(x => x.id !== s.id && !(x.location === s.location && x.categories.join() === s.categories.join()))];
+    const s = await Scout.scanArea({ location: $('#loc').value, radiusMiles: $('#radius').value, categories });
+    S.scans = [s, ...S.scans.filter(x => x.id !== s.id && !(x.location === s.location && x.categories.join() === s.categories.join()))].slice(0, 15); persist('scans');
     S.cur = s; S.tab = 'all'; renderScans(); render();
     const c = k => s.businesses.filter(b => b.presence === k).length;
     setStatus(`Found ${s.businesses.length} independent businesses near ${s.label.split(',').slice(0, 2).join(',')}: ${c('none')} with no website, ${c('social') + c('weak')} social or free sites, ${c('site')} to check.`);
@@ -264,7 +281,7 @@ $('#analyzeBtn').onclick = () => {
 $('#psiBtn').onclick = () => {
   const list = rows().map(r => r[0]).filter(b => { const a = S.analyses[b.url]; return a && a.ok && !S.psi[b.url]; });
   if (!list.length) return setStatus('Check websites first. PageSpeed runs on checked sites in the current view that don\'t have scores yet.', true);
-  pool(list.slice(0, 50), 2, async b => { S.psi[b.url] = await api('/api/pagespeed', { url: b.url }); }, 'Running PageSpeed (about 20 seconds each)');
+  pool(list.slice(0, 50), 2, async b => { S.psi[b.url] = await Scout.pageSpeed(b.url); persist('psi'); }, 'Running PageSpeed (about 20 seconds each)');
 };
 $('#stopBtn').onclick = () => { S.stop = true; setStatus('Stopping after the current sites finish…'); };
 
@@ -276,7 +293,7 @@ $('#list').addEventListener('change', e => {
   const id = e.target.dataset.lead || e.target.dataset.note; if (!id) return;
   const card = e.target.closest('.row');
   const lead = { id, status: card.querySelector('[data-lead]').value, note: card.querySelector('[data-note]').value };
-  S.leads[id] = lead; api('/api/lead', lead).catch(err => setStatus('Note not saved: ' + err.message, true));
+  S.leads[id] = { ...lead, at: new Date().toISOString() }; persist('leads');
 });
 $('#list').addEventListener('click', async e => {
   const id = e.target.dataset.one; if (!id) return;
@@ -295,24 +312,63 @@ $('#csvBtn').onclick = () => {
   a.download = `site-scout-${(S.cur?.location || 'leads').replace(/\W+/g, '-')}.csv`; a.click();
 };
 
-$('#settingsBtn').onclick = () => $('#settings').showModal();
-$('#saveKey').onclick = async () => {
-  try { const r = await api('/api/config', { psiKey: $('#psiKey').value }); $('#psiKey').value = ''; setStatus(r.hasPsiKey ? 'PageSpeed key saved.' : 'PageSpeed key removed.'); }
-  catch (err) { setStatus(err.message, true); }
+$('#settingsBtn').onclick = () => {
+  $('#psiState').textContent = S.hasPsiKey ? 'PageSpeed key: set in Cloudflare.' : 'PageSpeed key: not set. Add a PSI_KEY secret in Cloudflare for reliable PageSpeed scores (free, 25,000 checks a day).';
+  $('#settings').showModal();
 };
+$('#backupBtn').onclick = () => {
+  const data = { app: 'site-scout', v: 1, at: new Date().toISOString(), scans: S.scans, analyses: S.analyses, psi: S.psi, leads: S.leads };
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' }));
+  a.download = 'site-scout-backup-' + new Date().toISOString().slice(0, 10) + '.json'; a.click();
+};
+$('#restoreFile').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try {
+    const d = JSON.parse(await f.text());
+    if (d.app !== 'site-scout') throw new Error('That file is not a Site Scout backup.');
+    // Merge: keep anything on this device the backup doesn't have
+    S.scans = [...(d.scans || []), ...S.scans.filter(x => !(d.scans || []).some(y => y.id === x.id))].slice(0, 15);
+    Object.assign(S.analyses, d.analyses); Object.assign(S.psi, d.psi); Object.assign(S.leads, d.leads);
+    for (const k of ['scans', 'analyses', 'psi', 'leads']) persist(k);
+    S.cur = S.scans[0] || null; renderScans(); render(); $('#settings').close();
+    setStatus('Backup restored.');
+  } catch (err) { setStatus(err.message, true); }
+  e.target.value = '';
+};
+$('#lockBtn').onclick = () => { try { localStorage.removeItem('ss-pass'); } catch {} location.reload(); };
+
+// Ask for the passcode until the relay accepts it.
+async function unlock() {
+  for (;;) {
+    try { const r = await Scout.Relay.json('/api/ping'); S.hasPsiKey = r.hasPsiKey; return true; }
+    catch (err) {
+      const setup = /APP_PASSWORD/.test(err.message);
+      if (err.code !== 401 && !setup) { setStatus('Could not reach the app server: ' + err.message, true); return false; }
+      $('#gateErr').textContent = setup ? err.message : (Scout.Relay.pass ? 'That passcode didn\'t work.' : '');
+      if (!$('#gate').open) $('#gate').showModal();
+      Scout.Relay.pass = await new Promise(ok => { $('#gateForm').onsubmit = ev => { ev.preventDefault(); ok($('#passIn').value); }; });
+      try { localStorage.setItem('ss-pass', Scout.Relay.pass); } catch {}
+    }
+  }
+}
+$('#gate').addEventListener('cancel', e => e.preventDefault());
 
 (async () => {
+  try { Scout.Relay.pass = localStorage.getItem('ss-pass') || ''; } catch {}
+  let saved = ['food', 'beauty', 'auto', 'trades'];
+  try { saved = JSON.parse(localStorage.getItem('ss-cats')) || saved; } catch {}
+  $('#cats').innerHTML = Object.entries(Scout.CATEGORIES).map(([k, v]) => `<label class="chip"><input type="checkbox" value="${esc(k)}" ${saved.includes(k) ? 'checked' : ''}>${esc(v.label)}</label>`).join('');
   try {
-    const st = await api('/api/state');
-    Object.assign(S, { cats: st.categories, scans: st.scans, analyses: st.analyses, psi: st.psi, leads: st.leads, cur: st.scans[0] || null });
-    let saved = ['food', 'beauty', 'auto', 'trades'];
-    try { saved = JSON.parse(localStorage.getItem('ss-cats')) || saved; } catch {}
-    $('#cats').innerHTML = Object.entries(S.cats).map(([k, v]) => `<label class="chip"><input type="checkbox" value="${esc(k)}" ${saved.includes(k) ? 'checked' : ''}>${esc(v)}</label>`).join('');
-    if (S.cur) $('#loc').value = S.cur.location;
-    if (!st.hasPsiKey) $('#psiBtn').title = 'Add a free key in Settings for reliable PageSpeed scores';
-    renderScans(); render();
-  } catch (err) { setStatus('Could not reach the Site Scout server. Is the window running it still open?', true); }
+    const [scans, analyses, psi, leads] = await Promise.all(['scans', 'analyses', 'psi', 'leads'].map(k => DB.get(k)));
+    Object.assign(S, { scans: scans || [], analyses: analyses || {}, psi: psi || {}, leads: leads || {} });
+  } catch { setStatus('This browser won\'t let the app save data (private mode?). Scans still work but won\'t be kept.', true); }
+  S.cur = S.scans[0] || null;
+  if (S.cur) $('#loc').value = S.cur.location;
+  renderScans(); render();
+  await unlock();
+  if ($('#gate').open) $('#gate').close();
 })();
+
 }
 </script>
 </body>
