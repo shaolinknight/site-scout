@@ -264,7 +264,7 @@ $('#scanForm').addEventListener('submit', async e => {
   try { localStorage.setItem('ss-cats', JSON.stringify(categories)); } catch {}
   $('#scanBtn').disabled = true; setStatus('Scanning map data. Big areas can take up to a minute…');
   try {
-    const s = await Scout.scanArea({ location: $('#loc').value, radiusMiles: $('#radius').value, categories });
+    const s = await Scout.scanArea({ location: $('#loc').value, radiusMiles: $('#radius').value, categories }, msg => setStatus(msg));
     S.scans = [s, ...S.scans.filter(x => x.id !== s.id && !(x.location === s.location && x.categories.join() === s.categories.join()))].slice(0, 15); persist('scans');
     S.cur = s; S.tab = 'all'; renderScans(); render();
     const c = k => s.businesses.filter(b => b.presence === k).length;

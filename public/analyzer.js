@@ -51,7 +51,28 @@ function classifyWeb(tags) {
 }
 
 // ---------- step 1: find businesses ----------
-async function scanArea({ location, radiusMiles = 3, categories = [] }) {
+// The free map-data (Overpass) servers allow browser requests directly, and
+// they can be slow when busy: often 30–90 seconds. So the browser asks them
+// itself, waits up to 3 minutes per server, and reports the wait as it goes.
+// (Going through the Worker relay added a second timeout that cut it short.)
+const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+async function overpassQuery(query, onProgress = () => {}) {
+  let lastErr = 'The free map-data servers are busy right now.';
+  for (let i = 0; i < OVERPASS.length; i++) {
+    const host = new URL(OVERPASS[i]).hostname, start = Date.now();
+    const tick = setInterval(() => onProgress(`Waiting for map data${i ? ' (backup server ' + i + ')' : ''}… ${Math.round((Date.now() - start) / 1000)}s. Busy times can take 1–2 minutes.`), 1000);
+    try {
+      const r = await fetch(OVERPASS[i], { method: 'POST', body: 'data=' + encodeURIComponent(query), signal: AbortSignal.timeout(180000) });
+      if (r.ok) return await r.json();
+      lastErr = r.status === 429 ? 'The map-data server says too many requests. Wait a minute, then scan again.' : `Map server ${host} answered ${r.status}.`;
+    } catch (e) {
+      lastErr = e.name === 'TimeoutError' ? 'The free map-data servers are overloaded right now. Try again in a few minutes, or use a smaller radius.' : `Could not reach ${host}.`;
+    } finally { clearInterval(tick); }
+  }
+  throw new Error(lastErr);
+}
+
+async function scanArea({ location, radiusMiles = 3, categories = [] }, onProgress) {
   if (!location) throw new Error('Enter a city or ZIP code.');
   const cats = categories.filter(c => CATEGORIES[c]);
   if (!cats.length) throw new Error('Pick at least one category.');
@@ -62,7 +83,7 @@ async function scanArea({ location, radiusMiles = 3, categories = [] }) {
   const parts = [];
   for (const c of cats) for (const [k, v] of CATEGORIES[c].tags)
     parts.push(`nwr["${k}"~"^(${v})$"]["name"](around:${meters},${center.lat},${center.lon});`);
-  const data = await Relay.json('/api/overpass', { method: 'POST', body: `[out:json][timeout:80];(${parts.join('')});out center tags;` });
+  const data = await overpassQuery(`[out:json][timeout:170];(${parts.join('')});out center tags;`, onProgress);
 
   const businesses = [];
   for (const el of data.elements || []) {
