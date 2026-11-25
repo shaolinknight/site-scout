@@ -105,6 +105,72 @@ async function scanArea({ location, radiusMiles = 3, categories = [] }, onProgre
   return { id: Date.now().toString(36), at: new Date().toISOString(), location, label: geo[0].display_name, radiusMiles: +radiusMiles, categories: cats, businesses };
 }
 
+// ---------- step 1b: find websites the map data is missing ----------
+// OpenStreetMap often has no website listed even when the business has one.
+// Many small businesses own the obvious domain for their name, so we guess
+// likely domains, check which exist (free DNS lookup), and count a site only
+// if its page shows the business's phone number, or its name plus its city.
+const FILLER = new Set(['the', 'llc', 'inc', 'co', 'corp', 'ltd', 'pllc', 'pc', 'company', 'and', 'of']);
+const GENERIC = new Set(['auto', 'repair', 'service', 'services', 'salon', 'spa', 'shop', 'store', 'cafe', 'restaurant', 'grill', 'bar', 'plumbing', 'electric', 'heating', 'cooling', 'air', 'construction', 'landscaping', 'dental', 'family', 'center', 'studio', 'nails', 'hair', 'barber', 'barbershop', 'care', 'clinic', 'body', 'tire', 'tires', 'and', 'utah', 'home']);
+const slugWords = s => s.normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/&/g, ' and ').replace(/['’]/g, '').split(/[^a-z0-9]+/).filter(Boolean);
+
+function domainCandidates(name, city) {
+  const words = slugWords(name).filter(w => !['llc', 'inc', 'corp', 'ltd', 'pllc', 'pc'].includes(w));
+  const core = words.filter(w => w !== 'the');
+  const noAnd = core.filter(w => w !== 'and');
+  const c = slugWords(city || '').join('');
+  const bases = new Set([core.join(''), noAnd.join(''), core.join('-')]);
+  if (words[0] === 'the') bases.add(words.join('')); // "The Hair Lounge" → thehairlounge
+  if (noAnd.length > 2 && GENERIC.has(noAnd[noAnd.length - 1])) bases.add(noAnd.slice(0, -1).join('')); // "major league auto repair" → majorleagueauto
+  if (c) bases.add(noAnd.join('') + c);
+  const out = [];
+  const ok = b => b.replace(/-/g, '').length >= 5;
+  for (const b of bases) if (ok(b)) for (const tld of ['.com', '.net']) out.push(b + tld);
+  if (ok(core.join(''))) for (const tld of ['.co', '.biz', '.us']) out.push(core.join('') + tld);
+  return [...new Set(out)].slice(0, 12);
+}
+
+async function domainExists(d) {
+  try {
+    const j = await fetch('https://cloudflare-dns.com/dns-query?type=A&name=' + d, { headers: { accept: 'application/dns-json' }, signal: AbortSignal.timeout(8000) }).then(r => r.json());
+    return j.Status === 0 && (j.Answer || []).length > 0;
+  } catch { return false; }
+}
+
+// Does this page belong to this business? Returns 'phone', 'name', or null.
+function pageMatches(html, b, city) {
+  const head = html.slice(0, 400000);
+  if (/domain (is )?for sale|buy this domain|parked (free|domain)|this domain may be for sale/i.test(head.slice(0, 20000))) return null;
+  const digits = (b.phone || '').replace(/\D/g, '').slice(-10);
+  if (digits.length === 10) {
+    const re = new RegExp(digits.slice(0, 3) + '\\D{0,3}' + digits.slice(3, 6) + '\\D{0,3}' + digits.slice(6));
+    if (re.test(head)) return 'phone';
+  }
+  const text = head.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').toLowerCase();
+  const key = slugWords(b.name).filter(w => !FILLER.has(w) && w.length > 2);
+  const distinctive = key.filter(w => !GENERIC.has(w));
+  const need = distinctive.length ? distinctive : key;
+  const nameHit = need.length && need.every(w => text.includes(w));
+  const cityHit = city && text.includes(city.toLowerCase());
+  const streetNo = (b.address.match(/^\d+/) || [])[0];
+  const addrHit = streetNo && b.address && text.includes(streetNo);
+  return nameHit && (cityHit || addrHit) ? 'name' : null;
+}
+
+async function findWebsite(b, cityHint) {
+  const city = (b.address.split(',').pop() || '').trim() || cityHint;
+  const tried = [];
+  for (const d of domainCandidates(b.name, city)) {
+    if (!(await domainExists(d))) continue;
+    tried.push(d);
+    const page = await getPage('http://' + d + '/');
+    if (page.error || !page.html) continue;
+    const how = pageMatches(page.html, b, city);
+    if (how) return { url: page.finalUrl || 'http://' + d + '/', how, tried };
+  }
+  return { url: null, tried };
+}
+
 // ---------- step 2: analyze a website ----------
 async function getPage(url) {
   const r = await Relay.raw('/api/page?url=' + encodeURIComponent(url));
@@ -243,4 +309,4 @@ async function pageSpeed(url) {
   };
 }
 
-window.Scout = { Relay, CATEGORIES, scanArea, analyzeSite, pageSpeed, classifyWeb, releasesBehind };
+window.Scout = { Relay, CATEGORIES, scanArea, analyzeSite, pageSpeed, classifyWeb, releasesBehind, findWebsite, domainCandidates, pageMatches };

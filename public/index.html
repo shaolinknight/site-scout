@@ -104,6 +104,7 @@ dialog p{font-size:14px;color:var(--mute)}
     <input class="q" id="q" type="search" placeholder="Filter by name or type" aria-label="Filter">
     <label><input type="checkbox" id="wpOnly"> WordPress only</label>
     <select id="sort" aria-label="Sort"><option value="opp">Best leads first</option><option value="design">Worst design first</option><option value="seo">Worst SEO first</option><option value="name">Name A–Z</option></select>
+    <button id="findBtn" type="button">Find missing websites</button>
     <button id="analyzeBtn" type="button">Check websites</button>
     <button id="psiBtn" type="button">Run PageSpeed</button>
     <button id="stopBtn" type="button" hidden>Stop</button>
@@ -164,7 +165,7 @@ function info(b) {
 const isWp = i => !!(i.a && i.a.wp && i.a.wp.detected);
 const TABS = [
   ['all', 'All businesses', () => true],
-  ['none', 'No website', b => b.presence === 'none'],
+  ['none', 'No website found', b => b.presence === 'none'],
   ['social', 'Social or free site', b => b.presence === 'social' || b.presence === 'weak'],
   ['site', 'Has website', b => b.presence === 'site'],
   ['oldwp', 'Outdated WordPress', (b, i) => isWp(i) && (i.a.wp.outdated || (i.design && i.design.score < 60))],
@@ -196,7 +197,10 @@ function card(b, i) {
   if (wp && wp.outdated) badges.push(`<span class="b hot">${wp.behind} releases behind</span>`);
   if (a && a.builders) for (const x of a.builders) badges.push(`<span class="b">${esc(x)}</span>`);
   if (b.presence === 'site' && !a) badges.push('<span class="b">Not checked yet</span>');
+  if (b.foundBy) badges.push(`<span class="b" title="The map data listed no website. Site Scout found it and matched the business's ${b.foundBy === 'phone' ? 'phone number' : 'name and city'} on the page.">Site found by Scout (${b.foundBy === 'phone' ? 'phone match' : 'name match'})</span>`);
+  if (b.webCheck && !b.foundBy) badges.push(`<span class="b" title="Guessed domains: ${esc(b.webCheck.tried.join(', ') || 'none existed')}">No site at ${b.webCheck.count} likely domains</span>`);
   const maps = 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(b.name + ' ' + (b.address || ''));
+  const google = b.presence !== 'site' ? `<a href="${esc('https://www.google.com/search?q=' + encodeURIComponent(b.name + ' ' + ((b.address || '').split(',').pop() || S.cur?.location || '')))}" target="_blank" rel="noopener">Google it</a>` : '';
   const site = b.url && /^https?:\/\//.test(b.url) ? `<a href="${esc(b.url)}" target="_blank" rel="noopener">${esc(b.url.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, ''))}</a>` : '';
   const lead = i.lead || {};
   const det = [];
@@ -211,7 +215,7 @@ function card(b, i) {
     ${b.url && b.presence === 'site' ? `<button type="button" data-one="${esc(b.id)}">${a ? 'Re-check site' : 'Check this site'}</button>` : ''}</div>`);
   return `<article class="row" id="r-${esc(b.id.replace('/', '-'))}">
     <div><h2>${esc(b.name)}</h2>
-      <div class="meta"><span>${esc(b.kind)}</span>${b.address ? `<span>${esc(b.address)}</span>` : ''}${b.phone ? `<span>${esc(b.phone)}</span>` : ''}${site}<a href="${esc(maps)}" target="_blank" rel="noopener">Maps</a>${lead.status && lead.status !== 'new' ? `<span>· ${esc(lead.status)}</span>` : ''}</div>
+      <div class="meta"><span>${esc(b.kind)}</span>${b.address ? `<span>${esc(b.address)}</span>` : ''}${b.phone ? `<span>${esc(b.phone)}</span>` : ''}${site}<a href="${esc(maps)}" target="_blank" rel="noopener">Maps</a>${google}${lead.status && lead.status !== 'new' ? `<span>· ${esc(lead.status)}</span>` : ''}</div>
       <div class="badges">${badges.join('')}</div></div>
     <div class="meters">${meter('Design', i.design?.score)}${meter('SEO', i.seo?.score)}</div>
     <div class="opp"><b>${i.opp ?? '–'}</b><small>opportunity</small></div>
@@ -233,6 +237,7 @@ function render() {
   $('#analyzeBtn').textContent = unchecked ? `Check websites (${unchecked})` : 'Re-check websites';
   $('#analyzeBtn').disabled = S.running || !S.cur;
   $('#psiBtn').disabled = S.running || !S.cur;
+  $('#findBtn').disabled = S.running || !S.cur;
   $('#stopBtn').hidden = !S.running;
 }
 
@@ -256,6 +261,19 @@ async function pool(items, size, fn, label) {
   setStatus(`${S.stop ? 'Stopped' : 'Done'}: ${label.toLowerCase()} ${done} of ${items.length}${fails ? `, ${fails} failed` : ''}.`);
 }
 
+// Look for websites the map data missed (see findWebsite in analyzer.js).
+async function findMissing(list) {
+  const city = (S.cur.location || '').split(',')[0];
+  let found = 0;
+  await pool(list, 6, async b => {
+    const r = await Scout.findWebsite(b, city);
+    if (r.url) { b.origPresence = b.presence; b.presence = 'site'; b.url = r.url; b.foundBy = r.how; found++; }
+    b.webCheck = { count: Scout.domainCandidates(b.name, city).length, tried: r.tried, at: new Date().toISOString() };
+  }, 'Looking for websites the map data missed');
+  persist('scans');
+  return found;
+}
+
 async function checkSite(b) { S.analyses[b.url] = await Scout.analyzeSite(b.url); persist('analyses'); }
 
 $('#scanForm').addEventListener('submit', async e => {
@@ -267,12 +285,22 @@ $('#scanForm').addEventListener('submit', async e => {
     const s = await Scout.scanArea({ location: $('#loc').value, radiusMiles: $('#radius').value, categories }, msg => setStatus(msg));
     S.scans = [s, ...S.scans.filter(x => x.id !== s.id && !(x.location === s.location && x.categories.join() === s.categories.join()))].slice(0, 15); persist('scans');
     S.cur = s; S.tab = 'all'; renderScans(); render();
+    const missing = s.businesses.filter(b => b.presence === 'none' || b.presence === 'social');
+    const found = missing.length ? await findMissing(missing) : 0;
+    render();
     const c = k => s.businesses.filter(b => b.presence === k).length;
-    setStatus(`Found ${s.businesses.length} independent businesses near ${s.label.split(',').slice(0, 2).join(',')}: ${c('none')} with no website, ${c('social') + c('weak')} social or free sites, ${c('site')} to check.`);
+    setStatus((found ? `Found ${found} website${found === 1 ? "" : "s"} the map data was missing. ` : '') + `Found ${s.businesses.length} independent businesses near ${s.label.split(',').slice(0, 2).join(',')}: ${c('none')} with no website, ${c('social') + c('weak')} social or free sites, ${c('site')} to check.`);
   } catch (err) { setStatus(err.message, true); }
   $('#scanBtn').disabled = false;
 });
 
+$('#findBtn').onclick = async () => {
+  const list = S.cur.businesses.filter(b => (b.presence === 'none' || b.presence === 'social') && !b.webCheck);
+  const redo = list.length ? list : S.cur.businesses.filter(b => b.presence === 'none' || b.presence === 'social');
+  if (!redo.length) return setStatus('Every business in this scan already has a website.');
+  const found = await findMissing(redo);
+  setStatus(`Checked ${redo.length} businesses: found ${found} website${found === 1 ? "" : "s"} the map data was missing.${found ? ' Click Check websites to score them.' : ''}`);
+};
 $('#analyzeBtn').onclick = () => {
   const sites = S.cur.businesses.filter(b => b.presence === 'site');
   const todo = sites.filter(b => !S.analyses[b.url]);
